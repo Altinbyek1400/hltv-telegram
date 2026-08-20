@@ -425,12 +425,15 @@ def main() -> int:
     print(f"MODE={MODE} · {datetime.now(UB):%Y-%m-%d %H:%M} УБ")
     state = load_state()
 
-    if MODE == "daily":
-        run_daily(state)
-    else:
-        run_watch(state)
+    try:
+        if MODE == "daily":
+            run_daily(state)
+        else:
+            run_watch(state)
+    finally:
+        # Алдаа гарсан ч аль хэдийн илгээсэн постуудаа тэмдэглэж үлдээнэ
+        save_state(state)
 
-    save_state(state)
     print("Дууслаа.")
     return 0
 
