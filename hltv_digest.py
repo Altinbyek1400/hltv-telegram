@@ -1,279 +1,255 @@
 #!/usr/bin/env python3
 """
-HLTV Tier-1 (HLTV top-20 багууд) дайджест -> Telegram суваг.
+CS2 Tier-1 дайджест -> Telegram суваг.
+
+Эх сурвалж: bo3.gg нээлттэй JSON API (HLTV нь Cloudflare-аар хаагддаг тул).
 
 12 цаг тутам ажиллана:
-  - сүүлийн 12 цагт дууссан тоглолтын үр дүн
+  - сүүлийн 12 цагт дууссан tier-1 тоглолтын үр дүн
   - дараагийн 24 цагт болох тоглолтын хуваарь
-  - тоглолт бүрийн шат (Quarterfinal, Playoffs гэх мэт)
+  - тоглолт бүрийн тэмцээн ба шат (Playoffs, Group Stage гэх мэт)
 
-Орчны хувьсагч (environment variables):
+Орчны хувьсагч:
   TELEGRAM_BOT_TOKEN   BotFather-аас авсан токен
   TELEGRAM_CHAT_ID     @сувгийн_нэр эсвэл -100... хэлбэрийн ID
-  RESULT_WINDOW_HOURS  (сонголт, анхдагч 12)
-  UPCOMING_HOURS       (сонголт, анхдагч 24)
-  DRY_RUN              1 бол Telegram руу илгээхгүй, зөвхөн хэвлэнэ
+  RESULT_WINDOW_HOURS  анхдагч 12
+  UPCOMING_HOURS       анхдагч 24
+  MAX_RANK             анхдагч 20 — энэ зэрэглэлээс дээш багийг оруулна
+  DRY_RUN              1 бол илгээхгүй, зөвхөн хэвлэнэ
 """
 
 from __future__ import annotations
 
 import os
-import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 
 import requests
-from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------------- тохиргоо
 
-BASE = "https://www.hltv.org"
+API = "https://api.bo3.gg/api/v1/matches"
+SITE = "https://bo3.gg/matches/"
 UB = timezone(timedelta(hours=8))  # Asia/Ulaanbaatar
 
 RESULT_WINDOW_HOURS = int(os.environ.get("RESULT_WINDOW_HOURS", "12"))
 UPCOMING_HOURS = int(os.environ.get("UPCOMING_HOURS", "24"))
+MAX_RANK = int(os.environ.get("MAX_RANK", "20"))
 DRY_RUN = os.environ.get("DRY_RUN") == "1"
 
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Cache-Control": "no-cache",
+    "User-Agent": "cs2-tier1-digest/1.0 (Telegram channel bot)",
+    "Accept": "application/json",
 }
 
-SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
+TIERS = "s,a"  # bo3.gg-ийн tier ангилал: s = хамгийн дээд
 
 
 # ---------------------------------------------------------------- туслахууд
 
-def fetch(path: str, attempts: int = 4) -> BeautifulSoup:
-    """HLTV хуудсыг татаж BeautifulSoup болгож буцаана."""
-    url = path if path.startswith("http") else BASE + path
+def api_get(status: str, sort: str, limit: int = 60) -> list[dict]:
+    """bo3.gg-ээс тоглолтын жагсаалт татна."""
+    params = {
+        "filter[matches.status][in]": status,
+        "filter[matches.tier][in]": TIERS,
+        "sort": sort,
+        "page[limit]": str(limit),
+        "with": "teams,tournament,stage",
+    }
     last = None
-    for i in range(attempts):
+    for attempt in range(4):
         try:
-            r = SESSION.get(url, timeout=30)
+            r = requests.get(API, params=params, headers=HEADERS, timeout=30)
             if r.status_code == 200:
-                return BeautifulSoup(r.text, "html.parser")
+                return r.json().get("results", [])
             last = f"HTTP {r.status_code}"
-        except requests.RequestException as exc:  # сүлжээний алдаа
+        except (requests.RequestException, ValueError) as exc:
             last = str(exc)
-        time.sleep(3 * (i + 1))
-    raise RuntimeError(f"{url} татаж чадсангүй: {last}")
+        time.sleep(3 * (attempt + 1))
+    raise RuntimeError(f"bo3.gg API татаж чадсангүй ({status}): {last}")
 
 
-def clean(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "")).strip()
+def parse_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UB)
+    except ValueError:
+        return None
 
 
-def esc(text: str) -> str:
-    """Telegram HTML parse_mode-д зориулсан escape."""
+def esc(text) -> str:
     return (
-        (text or "")
+        str(text or "")
         .replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
 
 
-def unix_to_ub(ms) -> datetime | None:
-    try:
-        return datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc).astimezone(UB)
-    except (TypeError, ValueError):
-        return None
+def team_of(match: dict, side: str) -> tuple[str, int]:
+    """Багийн нэр ба зэрэглэлийг буцаана. Зэрэглэлгүй бол 999."""
+    node = match.get(side) or {}
+    name = node.get("name") or side
+    rank = node.get("rank")
+    return name, (rank if isinstance(rank, int) and rank > 0 else 999)
 
 
-# ---------------------------------------------------------------- top-20
-
-def top_teams(limit: int = 20) -> set[str]:
-    """HLTV дэлхийн зэрэглэлийн эхний N багийн нэрийг авна."""
-    soup = fetch("/ranking/teams")
-    names: list[str] = []
-    for box in soup.select(".ranked-team"):
-        node = box.select_one(".ranking-header .name") or box.select_one(".name")
-        if node:
-            name = clean(node.get_text())
-            if name and name not in names:
-                names.append(name)
-        if len(names) >= limit:
-            break
-    if not names:
-        raise RuntimeError("Зэрэглэлийн хуудаснаас баг олдсонгүй — HLTV бүтэц өөрчлөгдсөн байж магадгүй")
-    return {n.lower() for n in names}
+def is_tier1(match: dict) -> bool:
+    """S зэрэглэлийн тэмцээн, эсвэл top-N багтай тоглолт."""
+    if match.get("tier") == "s":
+        return True
+    _, r1 = team_of(match, "team1")
+    _, r2 = team_of(match, "team2")
+    return min(r1, r2) <= MAX_RANK
 
 
-def is_tier1(team_a: str, team_b: str, teams: set[str]) -> bool:
-    a, b = team_a.lower(), team_b.lower()
-    return a in teams or b in teams
+def stage_of(match: dict) -> str:
+    """Шатны нэрийг тэмцээний нэрээр давхардуулахгүйгээр буцаана."""
+    stage = (match.get("stage") or {}).get("title") or ""
+    tournament = (match.get("tournament") or {}).get("name") or ""
+    if tournament and stage.startswith(tournament):
+        stage = stage[len(tournament):].strip(" -–—:")
+    return stage
 
 
-# ---------------------------------------------------------------- үр дүн
+def bo_label(match: dict) -> str:
+    bo = match.get("bo_type")
+    return f"bo{bo}" if isinstance(bo, int) and bo > 0 else ""
 
-def recent_results(teams: set[str], since: datetime) -> list[dict]:
-    soup = fetch("/results")
-    out: list[dict] = []
 
-    for con in soup.select(".result-con"):
-        when = unix_to_ub(con.get("data-zonedgrouping-entry-unix"))
+# ---------------------------------------------------------------- цуглуулах
+
+def collect_results(since: datetime) -> list[dict]:
+    out = []
+    for m in api_get("finished", "-start_date"):
+        when = parse_dt(m.get("end_date")) or parse_dt(m.get("start_date"))
         if when is None or when < since:
             continue
-
-        cells = con.select(".team-cell .team")
-        if len(cells) < 2:
+        if not is_tier1(m):
             continue
-        t1, t2 = clean(cells[0].get_text()), clean(cells[1].get_text())
-        if not is_tier1(t1, t2, teams):
-            continue
-
-        score_node = con.select_one(".result-score")
-        score = clean(score_node.get_text()).replace(" ", "") if score_node else "?"
-
-        event_node = con.select_one(".event-name")
-        event = clean(event_node.get_text()) if event_node else ""
-
-        fmt_node = con.select_one(".map-text")
-        fmt = clean(fmt_node.get_text()) if fmt_node else ""
-
-        link = con.select_one("a[href]")
-        url = BASE + link["href"] if link else ""
-
-        won_left = bool(con.select_one(".team-cell .team-won"))
+        t1, _ = team_of(m, "team1")
+        t2, _ = team_of(m, "team2")
         out.append(
             {
                 "time": when,
                 "t1": t1,
                 "t2": t2,
-                "score": score,
-                "event": event,
-                "fmt": fmt,
-                "url": url,
-                "won_left": won_left,
+                "s1": m.get("team1_score", 0),
+                "s2": m.get("team2_score", 0),
+                "winner": m.get("winner_team_id"),
+                "id1": m.get("team1_id"),
+                "tournament": (m.get("tournament") or {}).get("name", ""),
+                "stage": stage_of(m),
+                "bo": bo_label(m),
+                "url": SITE + m["slug"] if m.get("slug") else "",
             }
         )
-
-    out.sort(key=lambda m: m["time"], reverse=True)
+    out.sort(key=lambda x: x["time"], reverse=True)
     return out
 
 
-# ---------------------------------------------------------------- хуваарь
-
-def upcoming_matches(teams: set[str], until: datetime, now: datetime) -> list[dict]:
-    soup = fetch("/matches")
-    out: list[dict] = []
-
-    for box in soup.select(".upcomingMatch"):
-        time_node = box.select_one(".matchTime")
-        when = unix_to_ub(time_node.get("data-unix")) if time_node else None
-        if when is None or when > until or when < now - timedelta(hours=3):
+def collect_upcoming(now: datetime, until: datetime) -> list[dict]:
+    out = []
+    for m in api_get("upcoming,current", "start_date"):
+        when = parse_dt(m.get("start_date"))
+        if when is None or when > until:
             continue
-
-        names = [clean(n.get_text()) for n in box.select(".matchTeamName")]
-        if len(names) < 2:
-            continue  # TBD эсвэл placeholder тоглолт
-        t1, t2 = names[0], names[1]
-        if not is_tier1(t1, t2, teams):
+        if when < now - timedelta(hours=4):
             continue
-
-        event_node = box.select_one(".matchEventName") or box.select_one(".matchEvent")
-        event = clean(event_node.get_text()) if event_node else ""
-
-        stage_node = box.select_one(".matchMeta")
-        fmt = clean(stage_node.get_text()) if stage_node else ""
-
-        # Шатны нэр (Quarterfinal, Playoffs гэх мэт) event блокоос гардаг
-        stage = ""
-        info = box.select_one(".matchInfoEmpty, .matchEventName")
-        parent_txt = clean(box.get_text(" "))
-        for keyword in (
-            "Grand Final", "Final", "Semi-final", "Semifinal",
-            "Quarter-final", "Quarterfinal", "Playoffs",
-            "Round of 16", "Group", "Swiss", "Qualifier",
-        ):
-            if keyword.lower() in parent_txt.lower():
-                stage = keyword
-                break
-
-        link = box.select_one("a[href]")
-        url = BASE + link["href"] if link else ""
-
+        if not is_tier1(m):
+            continue
+        t1, r1 = team_of(m, "team1")
+        t2, r2 = team_of(m, "team2")
         out.append(
             {
                 "time": when,
                 "t1": t1,
                 "t2": t2,
-                "event": event,
-                "fmt": fmt,
-                "stage": stage,
-                "url": url,
-                "live": when <= now,
+                "r1": r1,
+                "r2": r2,
+                "tournament": (m.get("tournament") or {}).get("name", ""),
+                "stage": stage_of(m),
+                "bo": bo_label(m),
+                "live": m.get("status") == "current" or when <= now,
+                "url": SITE + m["slug"] if m.get("slug") else "",
             }
         )
-
-    out.sort(key=lambda m: m["time"])
+    out.sort(key=lambda x: x["time"])
     return out
 
 
 # ---------------------------------------------------------------- мессеж
 
-def build_message(results: list[dict], upcoming: list[dict], now: datetime) -> str:
-    lines: list[str] = []
-    lines.append(f"<b>CS2 TIER-1 ДАЙДЖЕСТ</b>")
-    lines.append(f"<i>{now.strftime('%Y.%m.%d %H:%M')} (УБ цагаар)</i>")
-    lines.append("")
+def link(url: str, label: str) -> str:
+    return f'<a href="{url}">{label}</a>' if url else label
 
-    # --- үр дүн
-    lines.append(f"<b>Сүүлийн {RESULT_WINDOW_HOURS} цагийн үр дүн</b>")
+
+def build_message(results: list[dict], upcoming: list[dict], now: datetime) -> str:
+    L: list[str] = []
+    L.append("<b>CS2 TIER-1 ДАЙДЖЕСТ</b>")
+    L.append(f"<i>{now.strftime('%Y.%m.%d %H:%M')} · УБ цагаар</i>")
+    L.append("")
+
+    L.append(f"<b>ҮР ДҮН · сүүлийн {RESULT_WINDOW_HOURS} цаг</b>")
     if results:
         for m in results:
-            left = f"<b>{esc(m['t1'])}</b>" if m["won_left"] else esc(m["t1"])
-            right = esc(m["t2"]) if m["won_left"] else f"<b>{esc(m['t2'])}</b>"
-            fmt = f" · {esc(m['fmt'])}" if m["fmt"] else ""
-            head = f"{m['time'].strftime('%H:%M')}  {left} {m['score']} {right}"
-            if m["url"]:
-                head = f"{m['time'].strftime('%H:%M')}  <a href=\"{m['url']}\">{left} {m['score']} {right}</a>"
-            lines.append(head)
-            lines.append(f"      <i>{esc(m['event'])}{fmt}</i>")
+            a = esc(m["t1"])
+            b = esc(m["t2"])
+            if m["winner"] == m["id1"]:
+                a = f"<b>{a}</b>"
+            elif m["winner"]:
+                b = f"<b>{b}</b>"
+            label = "{} {}–{} {}".format(a, m["s1"], m["s2"], b)
+            L.append("{} · {}".format(m["time"].strftime("%H:%M"), link(m["url"], label)))
+            meta = " · ".join(x for x in (m["tournament"], m["stage"], m["bo"]) if x)
+            L.append(f"      <i>{esc(meta)}</i>")
     else:
-        lines.append("<i>Top-20 багийн дууссан тоглолт байхгүй.</i>")
-    lines.append("")
+        L.append("<i>Дууссан tier-1 тоглолт байхгүй.</i>")
+    L.append("")
 
-    # --- хуваарь
-    lines.append(f"<b>Дараагийн {UPCOMING_HOURS} цагийн хуваарь</b>")
+    L.append(f"<b>ХУВААРЬ · дараагийн {UPCOMING_HOURS} цаг</b>")
     if upcoming:
-        current_day = None
+        day = None
         for m in upcoming:
-            day = m["time"].strftime("%m.%d")
-            if day != current_day:
-                current_day = day
-                lines.append(f"<u>{day}</u>")
+            d = m["time"].strftime("%m.%d")
+            if d != day:
+                day = d
+                L.append(f"<u>{d}</u>")
             mark = "🔴 LIVE" if m["live"] else m["time"].strftime("%H:%M")
-            stage = f" · {esc(m['stage'])}" if m["stage"] else ""
-            fmt = f" · {esc(m['fmt'])}" if m["fmt"] else ""
-            pair = f"{esc(m['t1'])} vs {esc(m['t2'])}"
-            if m["url"]:
-                pair = f"<a href=\"{m['url']}\">{pair}</a>"
-            lines.append(f"{mark}  {pair}")
-            lines.append(f"      <i>{esc(m['event'])}{stage}{fmt}</i>")
+            pair = link(m["url"], f"{esc(m['t1'])} vs {esc(m['t2'])}")
+            L.append(f"{mark} · {pair}")
+            meta = " · ".join(x for x in (m["tournament"], m["stage"], m["bo"]) if x)
+            L.append(f"      <i>{esc(meta)}</i>")
     else:
-        lines.append("<i>Товлогдсон тоглолт байхгүй.</i>")
+        L.append("<i>Товлогдсон tier-1 тоглолт байхгүй.</i>")
 
-    lines.append("")
-    lines.append('<a href="https://www.hltv.org/">hltv.org</a>')
-    return "\n".join(lines)
+    L.append("")
+    L.append('<a href="https://bo3.gg/">bo3.gg</a>')
+    return "\n".join(L)
 
 
 # ---------------------------------------------------------------- Telegram
 
+def split_text(text: str, limit: int = 3900) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+    chunks, current = [], ""
+    for line in text.split("\n"):
+        if len(current) + len(line) + 1 > limit:
+            chunks.append(current.rstrip())
+            current = ""
+        current += line + "\n"
+    if current.strip():
+        chunks.append(current.rstrip())
+    return chunks
+
+
 def send(text: str) -> None:
-    """Telegram руу POST-оор илгээнэ. 4096 тэмдэгтээс урт бол хуваана."""
     if DRY_RUN:
         print(text)
         return
@@ -299,20 +275,6 @@ def send(text: str) -> None:
         time.sleep(1)
 
 
-def split_text(text: str, limit: int = 3900) -> list[str]:
-    if len(text) <= limit:
-        return [text]
-    chunks, current = [], ""
-    for line in text.split("\n"):
-        if len(current) + len(line) + 1 > limit:
-            chunks.append(current.rstrip())
-            current = ""
-        current += line + "\n"
-    if current.strip():
-        chunks.append(current.rstrip())
-    return chunks
-
-
 # ---------------------------------------------------------------- үндсэн
 
 def main() -> int:
@@ -321,13 +283,11 @@ def main() -> int:
     until = now + timedelta(hours=UPCOMING_HOURS)
 
     print(f"Ажиллаж эхэллээ: {now:%Y-%m-%d %H:%M} УБ")
-    teams = top_teams(20)
-    print(f"Top-20 баг: {len(teams)}")
 
-    results = recent_results(teams, since)
+    results = collect_results(since)
     print(f"Үр дүн: {len(results)}")
 
-    upcoming = upcoming_matches(teams, until, now)
+    upcoming = collect_upcoming(now, until)
     print(f"Хуваарь: {len(upcoming)}")
 
     send(build_message(results, upcoming, now))
